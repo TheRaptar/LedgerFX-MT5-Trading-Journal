@@ -60,6 +60,11 @@ class CollectorConfig:
     lookback_days: int = DEFAULT_LOOKBACK_DAYS
     chunk_days: int = DEFAULT_CHUNK_DAYS
     confirm_investor_session: bool = False
+    # Optional push to the user's own LedgerFX server (see collector/pusher.py).
+    push_url: Optional[str] = None
+    token_env: str = "LEDGERFX_INGEST_TOKEN"
+    token_file: Optional[Path] = None
+    no_csv: bool = False
 
     def validate(self) -> None:
         if self.mode not in {"incremental", "full"}:

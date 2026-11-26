@@ -9,8 +9,6 @@ import {
   Copy,
   Check,
   Pencil,
-  Eye,
-  EyeOff,
 } from 'lucide-react';
 import type {
   BalanceOperation,
@@ -20,7 +18,12 @@ import type {
   MT5OpenPosition,
   UserSettings,
 } from '../shared/types.ts';
-import { formatCurrency, formatTimestampWithServer } from '../shared/timeUtils.ts';
+import {
+  MT5_EET_US_DST_ZONE,
+  SERVER_TIMEZONE_OPTIONS,
+  formatCurrency,
+  formatTimestampWithServer,
+} from '../shared/timeUtils.ts';
 import { api } from '../lib/api.ts';
 
 interface AccountsViewProps {
@@ -77,14 +80,25 @@ const COMMON_MT5_SERVERS = [
   'MetaQuotes-Demo',
 ];
 
-const CONNECTION_DESCRIPTIONS: Record<'mt5_sandbox' | 'bridge_https' | 'csv_import', string> = {
-  mt5_sandbox:
-    'Encrypts your read-only broker credentials with AES-256-GCM and uses the built-in sandbox feed so you can test syncing and journaling immediately.',
+type ConnectionChoice = 'collector' | 'bridge_https' | 'csv_import' | 'mt5_sandbox';
+
+const CONNECTION_DESCRIPTIONS: Record<ConnectionChoice, string> = {
+  collector:
+    'Recommended for real data. You sign in to MT5 with the Investor (read-only) password inside your own MT5 terminal; the LedgerFX collector reads the history and pushes it here with a revocable token. No password is ever entered into or stored by this app.',
   bridge_https:
     'Connects over TLS to your self-hosted Python MetaTrader 5 bridge running beside your desktop MT5 terminal for automated live/demo history pulls.',
   csv_import:
-    'Creates your account profile without storing a password so you can upload real MetaTrader 5 Deal History CSV exports directly.',
+    'Creates your account profile so you can upload real MetaTrader 5 Deal History CSV exports directly. No password is stored.',
+  mt5_sandbox:
+    'SIMULATED demo account with generated sample trades. Only for trying out the app — never use it for a real account.',
 };
+
+function buildCollectorCommands(token: string, ingestUrl: string) {
+  return {
+    powershell: `$env:LEDGERFX_INGEST_TOKEN = "${token}"\npython collect_mt5.py --mode full --push-url "${ingestUrl}" --no-csv`,
+    cmd: `set LEDGERFX_INGEST_TOKEN=${token}\npython collect_mt5.py --mode full --push-url "${ingestUrl}" --no-csv`,
+  };
+}
 
 export function AccountsView({
   accounts,
@@ -101,16 +115,20 @@ export function AccountsView({
   const [showLinkForm, setShowLinkForm] = useState(Boolean(initialOpenLinkForm));
   const [friendlyName, setFriendlyName] = useState('');
   const [accountLogin, setAccountLogin] = useState('');
-  const [investorPassword, setInvestorPassword] = useState('');
-  const [showInvestorPassword, setShowInvestorPassword] = useState(false);
   const [brokerName, setBrokerName] = useState('');
   const [brokerServer, setBrokerServer] = useState('');
   const [environment, setEnvironment] = useState<'live' | 'demo'>('live');
   const [accountMode, setAccountMode] = useState<'hedging' | 'netting'>('hedging');
   const [currency, setCurrency] = useState('GBP');
   const [leverage, setLeverage] = useState(30);
-  const [serverUtcOffsetLabel, setServerUtcOffsetLabel] = useState('GMT+2');
-  const [connectionType, setConnectionType] = useState<'mt5_sandbox' | 'bridge_https' | 'csv_import'>('mt5_sandbox');
+  const [serverTimeZone, setServerTimeZone] = useState<string>(MT5_EET_US_DST_ZONE);
+  const [connectionType, setConnectionType] = useState<ConnectionChoice>('collector');
+  const [collectorInfo, setCollectorInfo] = useState<{ accountId: string; token: string; ingestUrl: string } | null>(
+    null,
+  );
+  const [collectorBusyId, setCollectorBusyId] = useState<string | null>(null);
+  const [collectorError, setCollectorError] = useState<string | null>(null);
+  const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
   const [bridgeUrl, setBridgeUrl] = useState('');
   const [emptyHistory, setEmptyHistory] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -123,7 +141,7 @@ export function AccountsView({
 
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
-  const [editPassword, setEditPassword] = useState('');
+  const [editServerTz, setEditServerTz] = useState<string>(MT5_EET_US_DST_ZONE);
   const [editError, setEditError] = useState<string | null>(null);
 
   const [copiedBridge, setCopiedBridge] = useState(false);
@@ -147,15 +165,14 @@ export function AccountsView({
       const payload = (await api.linkAccount({
         friendlyName,
         accountLogin,
-        investorPassword,
         brokerName: brokerName || 'MetaTrader 5 Broker',
         brokerServer,
         environment,
         accountMode,
         currency,
         leverage,
-        serverTimeZone: 'Europe/Athens',
-        serverUtcOffsetLabel,
+        serverTimeZone,
+        serverUtcOffsetLabel: 'GMT+2',
         connectionType,
         bridgeUrl: connectionType === 'bridge_https' ? bridgeUrl : undefined,
         emptyHistory,
@@ -165,15 +182,18 @@ export function AccountsView({
       setFormSuccess(
         selectedMode === 'csv_import'
           ? `Account "${friendlyName}" (#${accountLogin}) linked. Paste or upload your MT5 Deal History CSV below.`
-          : `Account "${friendlyName}" (#${accountLogin}) linked securely in read-only mode.`,
+          : selectedMode === 'collector'
+            ? `Account "${friendlyName}" (#${accountLogin}) linked. Follow the collector setup below to import its real history.`
+            : `Account "${friendlyName}" (#${accountLogin}) linked.`,
       );
       if (selectedMode === 'csv_import' && created) {
         setCsvAccountId(created.id);
       }
+      if (selectedMode === 'collector' && created) {
+        await handleGenerateToken(created.id);
+      }
       setFriendlyName('');
       setAccountLogin('');
-      setInvestorPassword('');
-      setShowInvestorPassword(false);
       setBrokerName('');
       setBrokerServer('');
       setBridgeUrl('');
@@ -185,16 +205,39 @@ export function AccountsView({
     }
   }
 
+  async function handleGenerateToken(accountId: string) {
+    setCollectorError(null);
+    setCollectorBusyId(accountId);
+    try {
+      const res = await api.createIngestToken(accountId);
+      onRefreshBootstrap(res.payload);
+      setCollectorInfo({ accountId, token: res.token, ingestUrl: res.ingestUrl });
+    } catch (err) {
+      setCollectorError(err instanceof Error ? err.message : 'Unable to generate collector token.');
+    } finally {
+      setCollectorBusyId(null);
+    }
+  }
+
+  async function copyCommand(key: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedCommand(key);
+      window.setTimeout(() => setCopiedCommand((cur) => (cur === key ? null : cur)), 2000);
+    } catch {
+      setCollectorError('Copy failed — select the command text and copy it manually.');
+    }
+  }
+
   async function handleSaveEdit(accountId: string) {
     setEditError(null);
     try {
       const payload = await api.updateAccount(accountId, {
         friendlyName: editName,
-        investorPassword: editPassword || undefined,
+        serverTimeZone: editServerTz,
       });
       onRefreshBootstrap(payload);
       setEditingAccountId(null);
-      setEditPassword('');
     } catch (err) {
       setEditError(err instanceof Error ? err.message : 'Unable to update account.');
     }
@@ -289,7 +332,7 @@ export function AccountsView({
             </h2>
             <span className="inline-flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
               <ShieldCheck className="w-4 h-4" aria-hidden="true" />
-              Investor password encrypted at rest; never logged
+              No MT5 password is entered into or stored by this app
             </span>
           </div>
 
@@ -304,14 +347,13 @@ export function AccountsView({
               </label>
               <select
                 value={connectionType}
-                onChange={(e) =>
-                  setConnectionType(e.target.value as 'mt5_sandbox' | 'bridge_https' | 'csv_import')
-                }
+                onChange={(e) => setConnectionType(e.target.value as ConnectionChoice)}
                 className="w-full px-3 py-2 text-xs rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
               >
-                <option value="mt5_sandbox">MT5 Direct Read-Only Connector (Sandbox Verified)</option>
-                <option value="bridge_https">Self-Hosted MT5 HTTPS Python Bridge (TLS)</option>
+                <option value="collector">Windows Read-Only Collector (real data, recommended)</option>
                 <option value="csv_import">MT5 Statement / Deal History CSV Only</option>
+                <option value="bridge_https">Self-Hosted MT5 HTTPS Python Bridge (TLS)</option>
+                <option value="mt5_sandbox">Demo Sandbox (SIMULATED sample data)</option>
               </select>
             </div>
 
@@ -344,39 +386,6 @@ export function AccountsView({
                 Numeric account number from MT5 → File → Login to Trade Account.
               </p>
             </div>
-
-            {connectionType !== 'csv_import' && (
-              <div>
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                  Read-Only Investor Password / Token *
-                </label>
-                <div className="relative">
-                  <input
-                    type={showInvestorPassword ? 'text' : 'password'}
-                    required
-                    value={investorPassword}
-                    onChange={(e) => setInvestorPassword(e.target.value)}
-                    placeholder="Enter read-only investor password"
-                    className="w-full pl-3 pr-9 py-2 text-xs rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowInvestorPassword((v) => !v)}
-                    aria-label={showInvestorPassword ? 'Hide investor password' : 'Show investor password'}
-                    className="absolute inset-y-0 right-0 px-2.5 flex items-center text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
-                  >
-                    {showInvestorPassword ? (
-                      <EyeOff className="w-3.5 h-3.5" aria-hidden="true" />
-                    ) : (
-                      <Eye className="w-3.5 h-3.5" aria-hidden="true" />
-                    )}
-                  </button>
-                </div>
-                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-                  Use your read-only Investor Password — never your Master trading password.
-                </p>
-              </div>
-            )}
 
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
@@ -483,17 +492,22 @@ export function AccountsView({
 
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                MT5 Server Time Zone Offset
+                Broker Server Clock (time zone)
               </label>
               <select
-                value={serverUtcOffsetLabel}
-                onChange={(e) => setServerUtcOffsetLabel(e.target.value)}
+                value={serverTimeZone}
+                onChange={(e) => setServerTimeZone(e.target.value)}
                 className="w-full px-3 py-2 text-xs rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
               >
-                <option value="GMT+2">GMT+2 / GMT+3 (Standard MT5 Broker)</option>
-                <option value="GMT+0">GMT / UTC</option>
-                <option value="GMT-5">GMT-5 (New York)</option>
+                {SERVER_TIMEZONE_OPTIONS.map((tz) => (
+                  <option key={tz.value} value={tz.value}>
+                    {tz.label}
+                  </option>
+                ))}
               </select>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
+                Controls trade times and sessions. Changeable later — timestamps are rebuilt automatically.
+              </p>
             </div>
           </div>
 
@@ -531,7 +545,7 @@ export function AccountsView({
               disabled={linking}
               className="px-4 py-2 text-xs font-medium rounded-md bg-slate-900 dark:bg-blue-600 text-white hover:bg-slate-800 dark:hover:bg-blue-500 disabled:opacity-60"
             >
-              {linking ? 'Validating & Encrypting...' : 'Connect Read-Only Account'}
+              {linking ? 'Linking...' : 'Link Read-Only Account'}
             </button>
           </div>
         </form>
@@ -545,7 +559,7 @@ export function AccountsView({
               No MT5 accounts linked yet
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-md mx-auto">
-              Connect your live or demo MetaTrader 5 account in read-only mode using your broker login, investor password, and server name.
+              Link your live or demo MetaTrader 5 account using its login number and server name, then import its real history with the read-only collector or a CSV export.
             </p>
             {!showLinkForm && (
               <button
@@ -595,23 +609,42 @@ export function AccountsView({
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      disabled={isSyncing}
-                      onClick={() => onSyncAccount(acc.id, { mode: 'incremental' })}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900 dark:bg-blue-600 text-white hover:bg-slate-800 dark:hover:bg-blue-500 disabled:opacity-60 whitespace-nowrap"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} aria-hidden="true" />
-                      {isSyncing ? 'Syncing...' : 'Sync Now'}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isSyncing}
-                      onClick={() => onSyncAccount(acc.id, { mode: 'reimport' })}
-                      className="px-3 py-1.5 text-xs font-medium rounded-md border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
-                    >
-                      Re-Import (Keep Notes)
-                    </button>
+                    {acc.connectionType === 'collector' && (
+                      <button
+                        type="button"
+                        disabled={collectorBusyId === acc.id}
+                        onClick={() => handleGenerateToken(acc.id)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900 dark:bg-blue-600 text-white hover:bg-slate-800 dark:hover:bg-blue-500 disabled:opacity-60 whitespace-nowrap"
+                      >
+                        <ShieldCheck className="w-3.5 h-3.5" aria-hidden="true" />
+                        {collectorBusyId === acc.id
+                          ? 'Generating...'
+                          : acc.hasIngestToken
+                            ? 'Rotate Collector Token'
+                            : 'Generate Collector Token'}
+                      </button>
+                    )}
+                    {acc.connectionType !== 'collector' && acc.connectionType !== 'csv_import' && (
+                      <>
+                        <button
+                          type="button"
+                          disabled={isSyncing}
+                          onClick={() => onSyncAccount(acc.id, { mode: 'incremental' })}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900 dark:bg-blue-600 text-white hover:bg-slate-800 dark:hover:bg-blue-500 disabled:opacity-60 whitespace-nowrap"
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} aria-hidden="true" />
+                          {isSyncing ? 'Syncing...' : 'Sync Now'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isSyncing}
+                          onClick={() => onSyncAccount(acc.id, { mode: 'reimport' })}
+                          className="px-3 py-1.5 text-xs font-medium rounded-md border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+                        >
+                          Re-Import (Keep Notes)
+                        </button>
+                      </>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
@@ -628,7 +661,7 @@ export function AccountsView({
                       onClick={() => {
                         setEditingAccountId(editingAccountId === acc.id ? null : acc.id);
                         setEditName(acc.friendlyName);
-                        setEditPassword('');
+                        setEditServerTz(acc.serverTimeZone || MT5_EET_US_DST_ZONE);
                         setEditError(null);
                       }}
                       aria-label={`Edit ${acc.friendlyName}`}
@@ -690,15 +723,71 @@ export function AccountsView({
                 {/* Sync Notice & Reliability Controls */}
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600 dark:text-slate-400 pt-2 border-t border-slate-100 dark:border-slate-800">
                   <p>{acc.syncNotice ?? 'Read-only connection ready.'}</p>
-                  <button
-                    type="button"
-                    disabled={isSyncing}
-                    onClick={() => onSyncAccount(acc.id, { simulatePartialFailure: true })}
-                    className="text-[11px] text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 underline whitespace-nowrap"
-                  >
-                    Test Partial Sync Failure Recovery
-                  </button>
+                  {acc.connectionType === 'mt5_sandbox' && (
+                    <button
+                      type="button"
+                      disabled={isSyncing}
+                      onClick={() => onSyncAccount(acc.id, { simulatePartialFailure: true })}
+                      className="text-[11px] text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 underline whitespace-nowrap"
+                    >
+                      Test Partial Sync Failure Recovery (simulated)
+                    </button>
+                  )}
                 </div>
+
+                {/* Collector token panel (token is shown once, right after it is generated) */}
+                {collectorError && collectorBusyId === null && collectorInfo?.accountId !== acc.id && editingAccountId !== acc.id && acc.connectionType === 'collector' && (
+                  <p role="alert" className="text-xs text-red-700 dark:text-red-400">{collectorError}</p>
+                )}
+                {collectorInfo?.accountId === acc.id && (
+                  <div className="p-4 rounded-md bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-900 space-y-3 text-xs">
+                    <div className="flex items-center gap-2 font-semibold text-blue-900 dark:text-blue-200">
+                      <ShieldCheck className="w-4 h-4" aria-hidden="true" />
+                      Collector setup — copy this now, the token is shown only once
+                    </div>
+                    <ol className="list-decimal pl-5 space-y-1 text-slate-700 dark:text-slate-300">
+                      <li>On Windows, open MetaTrader 5 and sign in to this account with the Investor (read-only) password.</li>
+                      <li>Open a terminal in the <span className="font-mono">mt5-collector</span> folder (Python 3.10+ and <span className="font-mono">pip install MetaTrader5</span>).</li>
+                      <li>Paste one of the commands below. Re-run it any time to pull new history — duplicates are never created.</li>
+                    </ol>
+                    {(() => {
+                      const cmds = buildCollectorCommands(collectorInfo.token, collectorInfo.ingestUrl);
+                      return (
+                        <div className="space-y-2">
+                          {([['powershell', 'PowerShell', cmds.powershell], ['cmd', 'Command Prompt', cmds.cmd]] as const).map(
+                            ([key, label, text]) => (
+                              <div key={key}>
+                                <div className="flex items-center justify-between mb-1">
+                                  <span className="font-medium text-slate-700 dark:text-slate-300">{label}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => copyCommand(key, text)}
+                                    className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200"
+                                  >
+                                    {copiedCommand === key ? <Check className="w-3 h-3" aria-hidden="true" /> : <Copy className="w-3 h-3" aria-hidden="true" />}
+                                    {copiedCommand === key ? 'Copied' : 'Copy'}
+                                  </button>
+                                </div>
+                                <pre className="font-mono text-[11px] bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">{text}</pre>
+                              </div>
+                            ),
+                          )}
+                        </div>
+                      );
+                    })()}
+                    <p className="text-slate-600 dark:text-slate-400">
+                      The URL uses this site&apos;s address. If LedgerFX runs on another machine than the one hosting it publicly, set{' '}
+                      <span className="font-mono">APP_URL</span> on the server so the URL is reachable from your Windows PC (HTTPS required except localhost).
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setCollectorInfo(null)}
+                      className="px-3 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200"
+                    >
+                      I&apos;ve saved it — hide token
+                    </button>
+                  </div>
+                )}
 
                 {acc.integrityWarnings.length > 0 && (
                   <div className="flex items-start gap-2 text-xs text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 rounded-md px-3.5 py-2.5">
@@ -715,23 +804,32 @@ export function AccountsView({
                 {editingAccountId === acc.id && (
                   <div className="p-4 rounded-md bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 space-y-3">
                     <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                      Edit Account Settings & Re-Validate Credentials
+                      Edit Account Settings
                     </p>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <input
                         value={editName}
                         onChange={(e) => setEditName(e.target.value)}
                         placeholder="Friendly account name"
+                        aria-label="Friendly account name"
                         className="px-3 py-1.5 text-xs rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
                       />
-                      <input
-                        type="password"
-                        value={editPassword}
-                        onChange={(e) => setEditPassword(e.target.value)}
-                        placeholder="New read-only investor password (leave blank to keep)"
+                      <select
+                        value={editServerTz}
+                        onChange={(e) => setEditServerTz(e.target.value)}
+                        aria-label="Broker server clock time zone"
                         className="px-3 py-1.5 text-xs rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100"
-                      />
+                      >
+                        {SERVER_TIMEZONE_OPTIONS.map((tz) => (
+                          <option key={tz.value} value={tz.value}>
+                            {tz.label}
+                          </option>
+                        ))}
+                      </select>
                     </div>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Changing the broker clock rebuilds every stored trade time from the original broker timestamps.
+                    </p>
                     {editError && <p className="text-xs text-red-700 dark:text-red-400">{editError}</p>}
                     <div className="flex justify-end gap-2">
                       <button
@@ -746,7 +844,7 @@ export function AccountsView({
                         onClick={() => handleSaveEdit(acc.id)}
                         className="px-3 py-1.5 text-xs font-medium rounded-md bg-slate-900 dark:bg-blue-600 text-white"
                       >
-                        Save & Re-Encrypt
+                        Save Changes
                       </button>
                     </div>
                   </div>

@@ -46,18 +46,51 @@ export function getCredentialSecret(): string {
   return ephemeralEncSecret;
 }
 
+/** Opens (and migrates) a database at any path, including ':memory:' — used by tests and getDb(). */
+export function openDatabase(filePath: string): Database.Database {
+  const db = new Database(filePath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  db.pragma('foreign_keys = ON');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('cache_size = -20000');
+  initSchema(db);
+  migrateSchema(db);
+  return db;
+}
+
 export function getDb(): Database.Database {
   if (dbInstance) return dbInstance;
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
-  const db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  initSchema(db);
+  const db = openDatabase(DB_PATH);
   dbInstance = db;
-  seedIfEmpty(db);
+  // Demo data is opt-in: fake accounts must never be mixed into a real trading journal.
+  if (process.env.SEED_DEMO_DATA === 'true') {
+    seedIfEmpty(db);
+  }
   return db;
+}
+
+/** Additive, idempotent migrations for databases created by earlier versions. */
+function migrateSchema(db: Database.Database): void {
+  const cols = (db.prepare('PRAGMA table_info(mt5_accounts)').all() as Array<{ name: string }>).map((c) => c.name);
+  if (!cols.includes('ingest_token_hash')) {
+    db.exec('ALTER TABLE mt5_accounts ADD COLUMN ingest_token_hash TEXT');
+  }
+  if (!cols.includes('reported_balance')) {
+    db.exec('ALTER TABLE mt5_accounts ADD COLUMN reported_balance REAL');
+  }
+  if (!cols.includes('reported_equity')) {
+    db.exec('ALTER TABLE mt5_accounts ADD COLUMN reported_equity REAL');
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_deals_account_position ON mt5_deals(account_id, position_id);
+    CREATE INDEX IF NOT EXISTS idx_deals_utc_time ON mt5_deals(utc_time);
+    CREATE INDEX IF NOT EXISTS idx_balance_ops_account_utc ON balance_operations(account_id, utc_time);
+    CREATE INDEX IF NOT EXISTS idx_open_positions_account ON mt5_open_positions(account_id);
+  `);
 }
 
 function initSchema(db: Database.Database): void {
@@ -317,51 +350,132 @@ export function insertAccountRow(
   );
 }
 
-export function upsertDeal(db: Database.Database, d: MT5Deal): void {
-  db.prepare(
-    `INSERT OR IGNORE INTO mt5_deals (
-      account_id, ticket, order_id, position_id, symbol, deal_type, deal_entry,
-      volume, price, profit, commission, swap, sl, tp, utc_time,
-      server_time_raw, server_tz_label, magic_number, comment
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    d.accountId,
-    d.ticket,
-    d.orderId,
-    d.positionId,
-    d.symbol,
-    d.dealType,
-    d.dealEntry,
-    d.volume,
-    d.price,
-    d.profit,
-    d.commission,
-    d.swap,
-    d.sl,
-    d.tp,
-    d.utcTime,
-    d.serverTimeRaw,
-    d.serverTzLabel,
-    d.magicNumber,
-    d.comment,
-  );
+export type UpsertResult = 'inserted' | 'updated' | 'unchanged';
+
+const stmtCache = new WeakMap<Database.Database, Map<string, Database.Statement>>();
+
+/** Prepared-statement cache so bulk imports of thousands of rows don't re-prepare SQL per row. */
+function stmt(db: Database.Database, sql: string): Database.Statement {
+  let perDb = stmtCache.get(db);
+  if (!perDb) {
+    perDb = new Map();
+    stmtCache.set(db, perDb);
+  }
+  let s = perDb.get(sql);
+  if (!s) {
+    s = db.prepare(sql);
+    perDb.set(sql, s);
+  }
+  return s;
 }
 
-export function upsertBalanceOp(db: Database.Database, op: BalanceOperation): void {
-  db.prepare(
-    `INSERT OR IGNORE INTO balance_operations (
-      account_id, ticket, deal_type, amount, utc_time, server_time_raw, server_tz_label, comment
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+const numEq = (a: unknown, b: unknown): boolean => {
+  if (a === null || a === undefined || b === null || b === undefined) {
+    return (a ?? null) === (b ?? null);
+  }
+  return Math.abs(Number(a) - Number(b)) < 1e-9;
+};
+
+/**
+ * Duplicate-safe write keyed by (account_id, ticket). New tickets are inserted; an existing ticket is
+ * UPDATED when the broker amended it (e.g. late commission/swap) and left alone when identical.
+ */
+export function upsertDeal(db: Database.Database, incoming: MT5Deal): UpsertResult {
+  const d = { ...incoming };
+  const existing = stmt(
+    db,
+    `SELECT order_id, position_id, symbol, deal_type, deal_entry, volume, price, profit, commission,
+            swap, sl, tp, utc_time, magic_number, comment
+     FROM mt5_deals WHERE account_id = ? AND ticket = ?`,
+  ).get(d.accountId, d.ticket) as Record<string, unknown> | undefined;
+
+  if (existing) {
+    // MT5 deals carry no SL/TP of their own (the collector derives them from order history). A re-sent
+    // row that could not be enriched (null) must never erase an SL/TP we already hold.
+    if (d.sl === null && existing.sl !== null && existing.sl !== undefined) d.sl = Number(existing.sl);
+    if (d.tp === null && existing.tp !== null && existing.tp !== undefined) d.tp = Number(existing.tp);
+  }
+
+  if (!existing) {
+    stmt(
+      db,
+      `INSERT INTO mt5_deals (
+        account_id, ticket, order_id, position_id, symbol, deal_type, deal_entry,
+        volume, price, profit, commission, swap, sl, tp, utc_time,
+        server_time_raw, server_tz_label, magic_number, comment
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      d.accountId, d.ticket, d.orderId, d.positionId, d.symbol, d.dealType, d.dealEntry,
+      d.volume, d.price, d.profit, d.commission, d.swap, d.sl, d.tp, d.utcTime,
+      d.serverTimeRaw, d.serverTzLabel, d.magicNumber, d.comment,
+    );
+    return 'inserted';
+  }
+
+  const same =
+    Number(existing.order_id) === d.orderId &&
+    Number(existing.position_id) === d.positionId &&
+    existing.symbol === d.symbol &&
+    existing.deal_type === d.dealType &&
+    existing.deal_entry === d.dealEntry &&
+    numEq(existing.volume, d.volume) &&
+    numEq(existing.price, d.price) &&
+    numEq(existing.profit, d.profit) &&
+    numEq(existing.commission, d.commission) &&
+    numEq(existing.swap, d.swap) &&
+    numEq(existing.sl, d.sl) &&
+    numEq(existing.tp, d.tp) &&
+    existing.utc_time === d.utcTime &&
+    Number(existing.magic_number) === d.magicNumber &&
+    String(existing.comment ?? '') === d.comment;
+  if (same) return 'unchanged';
+
+  stmt(
+    db,
+    `UPDATE mt5_deals SET order_id = ?, position_id = ?, symbol = ?, deal_type = ?, deal_entry = ?,
+       volume = ?, price = ?, profit = ?, commission = ?, swap = ?, sl = ?, tp = ?, utc_time = ?,
+       server_time_raw = ?, server_tz_label = ?, magic_number = ?, comment = ?
+     WHERE account_id = ? AND ticket = ?`,
   ).run(
-    op.accountId,
-    op.ticket,
-    op.dealType,
-    op.amount,
-    op.utcTime,
-    op.serverTimeRaw,
-    op.serverTzLabel,
-    op.comment,
+    d.orderId, d.positionId, d.symbol, d.dealType, d.dealEntry,
+    d.volume, d.price, d.profit, d.commission, d.swap, d.sl, d.tp, d.utcTime,
+    d.serverTimeRaw, d.serverTzLabel, d.magicNumber, d.comment,
+    d.accountId, d.ticket,
   );
+  return 'updated';
+}
+
+export function upsertBalanceOp(db: Database.Database, op: BalanceOperation): UpsertResult {
+  const existing = stmt(
+    db,
+    'SELECT deal_type, amount, utc_time, comment FROM balance_operations WHERE account_id = ? AND ticket = ?',
+  ).get(op.accountId, op.ticket) as Record<string, unknown> | undefined;
+
+  if (!existing) {
+    stmt(
+      db,
+      `INSERT INTO balance_operations (
+        account_id, ticket, deal_type, amount, utc_time, server_time_raw, server_tz_label, comment
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(op.accountId, op.ticket, op.dealType, op.amount, op.utcTime, op.serverTimeRaw, op.serverTzLabel, op.comment);
+    return 'inserted';
+  }
+
+  if (
+    existing.deal_type === op.dealType &&
+    numEq(existing.amount, op.amount) &&
+    existing.utc_time === op.utcTime &&
+    String(existing.comment ?? '') === op.comment
+  ) {
+    return 'unchanged';
+  }
+
+  stmt(
+    db,
+    `UPDATE balance_operations SET deal_type = ?, amount = ?, utc_time = ?, server_time_raw = ?,
+       server_tz_label = ?, comment = ? WHERE account_id = ? AND ticket = ?`,
+  ).run(op.dealType, op.amount, op.utcTime, op.serverTimeRaw, op.serverTzLabel, op.comment, op.accountId, op.ticket);
+  return 'updated';
 }
 
 export function upsertOpenPosition(db: Database.Database, p: MT5OpenPosition): void {
@@ -576,6 +690,9 @@ export function loadBootstrapPayload(db: Database.Database): BootstrapPayload {
     connectionType: r.connection_type as MT5Account['connectionType'],
     bridgeUrl: r.bridge_url ? String(r.bridge_url) : undefined,
     hasCredentials: Boolean(r.encrypted_credentials),
+    hasIngestToken: Boolean(r.ingest_token_hash),
+    reportedBalance: r.reported_balance !== null && r.reported_balance !== undefined ? Number(r.reported_balance) : null,
+    reportedEquity: r.reported_equity !== null && r.reported_equity !== undefined ? Number(r.reported_equity) : null,
     initialBalance: Number(r.initial_balance),
     balance: Number(r.balance),
     equity: Number(r.equity),

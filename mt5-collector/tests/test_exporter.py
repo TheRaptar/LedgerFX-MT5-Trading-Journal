@@ -356,13 +356,14 @@ class MT5CollectorTests(unittest.TestCase):
             "order_calc_margin",
             "order_calc_profit",
             "getpass",
-            "urllib",
-            "http.client",
             "import requests",
             "import socket",
             "import httpx",
             "mt5.login(",
         ]
+        # Network code is allowed ONLY in the opt-in pusher module, which talks to the single
+        # operator-configured LedgerFX URL. Everything else must stay network-free.
+        network_tokens = ["urllib", "http.client"]
         for file_path in source_files:
             content = file_path.read_text(encoding="utf-8")
             for token in forbidden_tokens:
@@ -371,6 +372,13 @@ class MT5CollectorTests(unittest.TestCase):
                     content,
                     msg=f"Forbidden token '{token}' found in {file_path.name}",
                 )
+            if file_path.name != "pusher.py":
+                for token in network_tokens:
+                    self.assertNotIn(
+                        token,
+                        content,
+                        msg=f"Network token '{token}' found outside pusher.py in {file_path.name}",
+                    )
 
 
 if __name__ == "__main__":

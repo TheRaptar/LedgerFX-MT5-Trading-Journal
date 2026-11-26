@@ -1,5 +1,12 @@
 import type { SessionWindowConfig, UserSettings } from './types.ts';
 
+/**
+ * Pseudo-zone for the very common MT5 broker convention: server clock is GMT+2 in winter and
+ * GMT+3 while US daylight saving time is active (the FX "New York close" convention).
+ * Note this differs from Europe/Athens for ~3 weeks each spring and autumn.
+ */
+export const MT5_EET_US_DST_ZONE = 'MT5/EET-US-DST';
+
 export const AVAILABLE_TIMEZONES = [
   { value: 'Europe/London', label: 'Europe/London (GMT / BST)' },
   { value: 'UTC', label: 'UTC (Coordinated Universal Time)' },
@@ -10,6 +17,77 @@ export const AVAILABLE_TIMEZONES = [
   { value: 'Asia/Singapore', label: 'Asia/Singapore (SGT)' },
   { value: 'Australia/Sydney', label: 'Australia/Sydney (AEST / AEDT)' },
 ];
+
+/** Zones that may be chosen as the *broker server* clock (never used as a display zone). */
+export const SERVER_TIMEZONE_OPTIONS = [
+  { value: MT5_EET_US_DST_ZONE, label: 'GMT+2 winter / GMT+3 summer, US DST schedule (most FX brokers)' },
+  { value: 'Europe/Athens', label: 'Europe/Athens (GMT+2 / GMT+3, EU DST schedule)' },
+  { value: 'Europe/London', label: 'Europe/London (GMT / BST)' },
+  { value: 'Europe/Frankfurt', label: 'Europe/Frankfurt (CET / CEST)' },
+  { value: 'UTC', label: 'UTC' },
+];
+
+/** UTC offset (ms) of an IANA zone at a given instant. */
+function ianaOffsetMs(timeZone: string, utcMs: number): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(new Date(utcMs));
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? '0');
+  const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+  return asUtc - Math.floor(utcMs / 1000) * 1000;
+}
+
+/** Offset of the broker server clock from UTC (ms) at a given UTC instant. */
+export function serverOffsetMsAt(utcMs: number, serverTimeZone: string | null | undefined, fallbackLabel = 'GMT+2'): number {
+  const zone = (serverTimeZone ?? '').trim();
+  if (zone === MT5_EET_US_DST_ZONE) {
+    return ianaOffsetMs('America/New_York', utcMs) === -4 * 3600_000 ? 3 * 3600_000 : 2 * 3600_000;
+  }
+  if (zone) {
+    try {
+      return ianaOffsetMs(zone, utcMs);
+    } catch {
+      // fall through to the fixed label
+    }
+  }
+  const match = fallbackLabel.match(/GMT\s*([+-]\d+(?::?\d+)?)/i);
+  const hours = match ? Number(match[1].replace(':', '.')) : 2;
+  return (Number.isFinite(hours) ? hours : 2) * 3600_000;
+}
+
+/**
+ * Converts an MT5 server wall-clock string ("2026.11.10 09:15:01" or ISO-like) to a UTC ISO string,
+ * honouring daylight saving for the account's server zone. Returns null when the text is not a valid time
+ * (callers must skip/warn — never substitute "now").
+ */
+export function serverWallClockToUtcIso(
+  raw: string,
+  serverTimeZone: string | null | undefined,
+  fallbackLabel = 'GMT+2',
+): string | null {
+  const text = (raw ?? '').trim();
+  if (!text) return null;
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(text) && text.includes('T')) {
+    const direct = new Date(text);
+    return Number.isNaN(direct.getTime()) ? null : direct.toISOString();
+  }
+  const m = text.match(/^(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s] = m;
+  const wall = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s ?? 0));
+  if (Number.isNaN(wall)) return null;
+  // Two-pass resolution handles instants near a DST transition.
+  let utc = wall - serverOffsetMsAt(wall, serverTimeZone, fallbackLabel);
+  utc = wall - serverOffsetMsAt(utc, serverTimeZone, fallbackLabel);
+  return new Date(utc).toISOString();
+}
 
 export function getShortTimeZoneName(date: Date, timeZone: string): string {
   try {

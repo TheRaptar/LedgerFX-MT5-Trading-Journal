@@ -114,3 +114,23 @@ python -m unittest discover -s tests -v
 # LedgerFX CSV importer compatibility test (from repository root)
 npx tsx mt5-collector/tests/verify_ledgerfx_import.ts
 ```
+
+## Push straight into LedgerFX (recommended)
+
+Instead of exporting CSVs by hand, the collector can send the history directly to your own LedgerFX server. No MT5 password is involved: you sign in to MT5 with the Investor password inside the terminal, and the collector authenticates to LedgerFX with a revocable per-account **ingest token**.
+
+1. In LedgerFX → Accounts, link the account with connection type **Windows Read-Only Collector**, and pick the broker clock (`MT5/EET-US-DST` is right for most brokers: GMT+2 winter / GMT+3 during US DST).
+2. Copy the token shown once (it is stored only as a SHA-256 hash; "Rotate Collector Token" revokes the old one).
+3. Run (PowerShell):
+
+   ```powershell
+   $env:LEDGERFX_INGEST_TOKEN = "<token>"
+   python collect_mt5.py --mode full --push-url "https://your-ledgerfx/api/ingest/<accountId>" --no-csv
+   ```
+
+   Use `--token-file path` instead of the env var if you prefer. Plain HTTP is refused except for localhost. The server must see the same login and server name as the linked account and refuses sessions where trading is enabled.
+4. Re-run any time (`--mode incremental`). Records are upserted by (account, ticket), so nothing is duplicated; the checkpoint only advances after the server accepts the data.
+
+A balance-mismatch warning means the imported history does not add up to the broker-reported balance (usually history older than the fetched range: run `--mode full`).
+
+Server settings: `APP_URL` (public base URL used in the ingest URL), `SEED_DEMO_DATA=true` (opt-in demo data; off by default).
