@@ -1,0 +1,4 @@
+currencyfied.com, www.currencyfied.com {
+	encode gzip
+	reverse_proxy ledgerfx:3000
+}

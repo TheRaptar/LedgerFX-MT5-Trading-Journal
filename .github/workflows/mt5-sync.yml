@@ -1,0 +1,92 @@
+# Free automatic MT5 -> LedgerFX sync on a GitHub-hosted Windows runner.
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   MT5_LOGIN, MT5_INVESTOR_PASSWORD, MT5_SERVER, LEDGERFX_INGEST_URL, LEDGERFX_INGEST_TOKEN
+# The collector aborts if the session allows trading, so a master password can never be used here.
+name: MT5 Auto Sync
+
+on:
+  schedule:
+    - cron: "23 */2 * * *"   # every 2 hours (GitHub may delay scheduled runs)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = complete history, incremental = recent window"
+        default: "incremental"
+        type: choice
+        options: [incremental, full]
+
+concurrency:
+  group: mt5-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install collector dependencies
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check -r mt5-collector/requirements.txt
+
+      - name: Install MetaTrader 5 terminal
+        shell: pwsh
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP "mt5setup.exe"
+          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $setup
+          Start-Process -FilePath $setup -ArgumentList "/auto" -Wait
+          $terminal = "C:\Program Files\MetaTrader 5\terminal64.exe"
+          if (-not (Test-Path $terminal)) { throw "MT5 terminal was not installed at the expected path." }
+          "MT5_TERMINAL=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Start terminal signed in (read-only)
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_INVESTOR_PASSWORD: ${{ secrets.MT5_INVESTOR_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+        run: |
+          foreach ($n in "MT5_LOGIN","MT5_INVESTOR_PASSWORD","MT5_SERVER") {
+            if (-not (Get-Item "env:$n" -ErrorAction SilentlyContinue).Value) { throw "Missing repository secret for $n." }
+          }
+          $ini = Join-Path $env:RUNNER_TEMP "mt5-startup.ini"
+          @(
+            "[Common]",
+            "Login=$env:MT5_LOGIN",
+            "Password=$env:MT5_INVESTOR_PASSWORD",
+            "Server=$env:MT5_SERVER",
+            "KeepPrivate=1",
+            "NewsEnable=0"
+          ) | Set-Content -Path $ini -Encoding ASCII
+          Start-Process -FilePath $env:MT5_TERMINAL -ArgumentList "/config:`"$ini`""
+          Start-Sleep -Seconds 45
+          Remove-Item $ini -Force   # the terminal has already read it; do not leave the password on disk
+
+      - name: Collect and push to LedgerFX
+        shell: pwsh
+        env:
+          LEDGERFX_INGEST_TOKEN: ${{ secrets.LEDGERFX_INGEST_TOKEN }}
+          LEDGERFX_INGEST_URL: ${{ secrets.LEDGERFX_INGEST_URL }}
+          SYNC_MODE: ${{ github.event.inputs.mode || 'incremental' }}
+        working-directory: mt5-collector
+        run: |
+          $args = @("collect_mt5.py", "--mode", $env:SYNC_MODE, "--lookback-days", "30",
+                    "--confirm-investor-session", "--push-url", $env:LEDGERFX_INGEST_URL,
+                    "--terminal-path", $env:MT5_TERMINAL, "--no-csv")
+          $code = 1
+          for ($i = 1; $i -le 6; $i++) {
+            python @args
+            $code = $LASTEXITCODE
+            if ($code -ne 1) { break }          # 0 = ok, 2 = refused (trading enabled): never retry
+            Write-Host "Attempt $i failed (terminal may still be connecting). Retrying in 30s..."
+            Start-Sleep -Seconds 30
+          }
+          exit $code
