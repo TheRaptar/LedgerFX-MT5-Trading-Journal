@@ -78,7 +78,6 @@ export const api = {
   linkAccount: (body: {
     friendlyName: string;
     accountLogin: string;
-    investorPassword: string;
     brokerName: string;
     brokerServer: string;
     environment: 'live' | 'demo';
@@ -87,7 +86,7 @@ export const api = {
     leverage: number;
     serverTimeZone: string;
     serverUtcOffsetLabel: string;
-    connectionType: 'bridge_https' | 'mt5_sandbox' | 'csv_import';
+    connectionType: 'collector' | 'bridge_https' | 'mt5_sandbox' | 'csv_import';
     bridgeUrl?: string;
     emptyHistory?: boolean;
   }) =>
@@ -96,9 +95,21 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  createIngestToken: (id: string) =>
+    apiRequest<{ token: string; ingestUrl: string; payload: BootstrapPayload }>(
+      `/api/accounts/${encodeURIComponent(id)}/ingest-token`,
+      { method: 'POST' },
+    ),
+
   updateAccount: (
     id: string,
-    body: { friendlyName?: string; investorPassword?: string; leverage?: number; bridgeUrl?: string },
+    body: {
+      friendlyName?: string;
+      leverage?: number;
+      bridgeUrl?: string;
+      serverTimeZone?: string;
+      serverUtcOffsetLabel?: string;
+    },
   ) =>
     apiRequest<BootstrapPayload>(`/api/accounts/${encodeURIComponent(id)}`, {
       method: 'PATCH',

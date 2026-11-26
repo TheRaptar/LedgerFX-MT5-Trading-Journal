@@ -1,6 +1,12 @@
 export type AccountMode = 'hedging' | 'netting';
 export type AccountEnvironment = 'live' | 'demo';
-export type ConnectionType = 'bridge_https' | 'mt5_sandbox' | 'csv_import';
+/**
+ * collector     – real data pushed by the Windows read-only collector (recommended)
+ * csv_import    – manual CSV upload only
+ * bridge_https  – self-hosted HTTPS bridge pulled by the server
+ * mt5_sandbox   – SIMULATED demo data (never use for a real account)
+ */
+export type ConnectionType = 'collector' | 'bridge_https' | 'mt5_sandbox' | 'csv_import';
 
 export interface MT5Account {
   id: string;
@@ -17,6 +23,11 @@ export interface MT5Account {
   connectionType: ConnectionType;
   bridgeUrl?: string;
   hasCredentials: boolean;
+  /** True once a collector ingest token has been generated for this account. */
+  hasIngestToken?: boolean;
+  /** Last balance/equity the broker itself reported through the collector (null if never). */
+  reportedBalance?: number | null;
+  reportedEquity?: number | null;
   initialBalance: number;
   balance: number;
   equity: number;
@@ -146,6 +157,8 @@ export interface ClosedTrade {
   session: 'Asia' | 'London' | 'New York' | 'London/NY Overlap' | 'Off-Hours';
   journal: TradeJournalEntry | null;
   initialRiskCurrency: number | null;
+  /** How initialRiskCurrency was obtained: user-entered, implied from the trade's own P/L, or a pip-value heuristic. */
+  riskSource?: 'manual' | 'implied' | 'heuristic' | null;
   rMultiple: number | null;
   outcome: 'win' | 'loss' | 'breakeven';
 }

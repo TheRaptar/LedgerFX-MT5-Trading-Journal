@@ -8,7 +8,8 @@ using the official MetaTrader5 Python package and exports LedgerFX-compatible CS
 Safeguards:
 - Never requests, stores, transmits, or logs any MT5 Master or Investor password.
 - Never performs trading, order placement, modification, copying, or account management.
-- Makes zero external network requests or cloud uploads.
+- Makes zero network requests by default. Only if you pass --push-url does it send history (never
+  passwords) over HTTPS to YOUR OWN LedgerFX server, authenticated by a revocable per-account token.
 - Displays a clear Investor Password session verification warning and requires explicit
   manual confirmation before reading real account history (unless explicitly acknowledged
   for scheduled runs via --confirm-investor-session).
@@ -37,6 +38,21 @@ from collector.mt5_client import (
     MT5BackendProtocol,
     MT5CollectorError,
     ReadOnlyMT5Client,
+)
+from collector.payload import (
+    build_account_info,
+    build_deal_rows,
+    build_open_position_rows,
+    collection_stats,
+    positions_missing_entry,
+)
+from collector.pusher import (
+    DEFAULT_TOKEN_ENV,
+    PushError,
+    PushSummary,
+    push_in_chunks,
+    read_ingest_token,
+    validate_push_url,
 )
 from collector.sample_generator import write_synthetic_sample_directory
 from collector.state import load_checkpoint, save_checkpoint_with_backup
@@ -189,6 +205,16 @@ def run_collection(
     config.validate()
     run_now = now_utc or datetime.now(timezone.utc)
 
+    push_url: Optional[str] = None
+    push_token = ""
+    if config.push_url:
+        try:
+            push_url = validate_push_url(config.push_url)
+            push_token = read_ingest_token(config.token_env, config.token_file)
+        except (ValueError, PushError) as exc:
+            print(f"LEDGERFX PUSH CONFIGURATION ERROR: {exc}", file=out)
+            return 1
+
     try:
         with ReadOnlyMT5Client(terminal_path=config.terminal_path, backend=backend) as client:
             snapshot = client.get_account_snapshot()
@@ -217,28 +243,63 @@ def run_collection(
             raw_orders = client.get_history_orders(date_from, date_to, chunk_days=config.chunk_days)
             open_positions = client.get_open_positions()
 
-            artifacts = export_collection_bundle(
-                output_dir=config.output_dir,
-                namespace=namespace,
-                snapshot=snapshot,
-                raw_deals=raw_deals,
-                raw_orders=raw_orders,
-                open_positions=open_positions,
-                mode=config.mode,
-                previous_highest_deal_ticket=checkpoint.highest_deal_ticket,
-                previous_highest_order_ticket=checkpoint.highest_order_ticket,
-                now_utc=run_now,
-                investor_session_confirmation_method=confirmation_method,
-            )
+            push_summary: Optional[PushSummary] = None
+            push_warnings: list[str] = []
+            if push_url:
+                # Push mode: a trading-enabled session is never acceptable, regardless of confirmation.
+                if snapshot.trade_allowed:
+                    print(
+                        "ABORTED: account.trade_allowed is True, so this is not a read-only Investor-password "
+                        "session. Nothing was pushed to LedgerFX.",
+                        file=out,
+                    )
+                    return 2
+                # Recover original SL/TP for positions opened before the fetch window.
+                missing = positions_missing_entry(raw_deals)
+                extra_orders = client.get_orders_for_positions(missing) if missing else []
+                deal_rows, balance_rows, push_warnings = build_deal_rows(
+                    raw_deals, list(raw_orders) + list(extra_orders)
+                )
+                push_summary = push_in_chunks(
+                    push_url,
+                    push_token,
+                    build_account_info(snapshot),
+                    deal_rows,
+                    balance_rows,
+                    build_open_position_rows(open_positions),
+                )
 
-            checkpoint.highest_deal_ticket = artifacts.highest_deal_ticket
-            checkpoint.highest_order_ticket = artifacts.highest_order_ticket
-            if artifacts.last_deal_server_epoch > checkpoint.last_deal_server_epoch:
-                checkpoint.last_deal_server_epoch = artifacts.last_deal_server_epoch
+            if config.no_csv and push_summary is not None:
+                artifacts = None
+                highest_deal, highest_order, last_epoch = collection_stats(raw_deals, raw_orders)
+            else:
+                artifacts = export_collection_bundle(
+                    output_dir=config.output_dir,
+                    namespace=namespace,
+                    snapshot=snapshot,
+                    raw_deals=raw_deals,
+                    raw_orders=raw_orders,
+                    open_positions=open_positions,
+                    mode=config.mode,
+                    previous_highest_deal_ticket=checkpoint.highest_deal_ticket,
+                    previous_highest_order_ticket=checkpoint.highest_order_ticket,
+                    now_utc=run_now,
+                    investor_session_confirmation_method=confirmation_method,
+                )
+                highest_deal = artifacts.highest_deal_ticket
+                highest_order = artifacts.highest_order_ticket
+                last_epoch = artifacts.last_deal_server_epoch
+
+            # Checkpoint only moves after the data is safely delivered (CSV written and/or push confirmed).
+            checkpoint.highest_deal_ticket = max(checkpoint.highest_deal_ticket, highest_deal)
+            checkpoint.highest_order_ticket = max(checkpoint.highest_order_ticket, highest_order)
+            if last_epoch > checkpoint.last_deal_server_epoch:
+                checkpoint.last_deal_server_epoch = last_epoch
             checkpoint.last_collection_utc = run_now.strftime("%Y-%m-%dT%H:%M:%SZ")
             checkpoint.last_mode = config.mode
             checkpoint.total_runs += 1
-            checkpoint.last_deals_export_file = str(artifacts.deals_csv)
+            if artifacts is not None:
+                checkpoint.last_deals_export_file = str(artifacts.deals_csv)
 
             cp_path, cp_backup = save_checkpoint_with_backup(
                 state_dir=config.state_dir,
@@ -255,33 +316,58 @@ def run_collection(
             print(f"  Broker Server     : {snapshot.server}", file=out)
             print(f"  Collection Mode   : {config.mode}", file=out)
             print(f"  History Window    : {date_from.strftime('%Y-%m-%d')} -> {date_to.strftime('%Y-%m-%d')} (UTC)", file=out)
-            print(f"  Deals Exported    : {artifacts.deals_exported} ({artifacts.trade_deals_exported} trade, {artifacts.balance_ops_exported} balance ops)", file=out)
-            print(f"  Orders Exported   : {artifacts.orders_exported}", file=out)
-            print(f"  Open Positions    : {artifacts.open_positions_exported}", file=out)
-            print(f"  Highest Ticket    : #{artifacts.highest_deal_ticket}", file=out)
-            print("-" * 76, file=out)
-            print(f"  LedgerFX Deals CSV: {artifacts.deals_csv}", file=out)
-            print(f"  Account Info CSV  : {artifacts.account_info_csv}", file=out)
-            print(f"  Open Positions CSV: {artifacts.open_positions_csv}", file=out)
-            print(f"  Orders CSV        : {artifacts.orders_csv}", file=out)
-            print(f"  Run Report JSON   : {artifacts.report_json}", file=out)
+            if artifacts is not None:
+                print(f"  Deals Exported    : {artifacts.deals_exported} ({artifacts.trade_deals_exported} trade, {artifacts.balance_ops_exported} balance ops)", file=out)
+                print(f"  Orders Exported   : {artifacts.orders_exported}", file=out)
+                print(f"  Open Positions    : {artifacts.open_positions_exported}", file=out)
+            print(f"  Highest Ticket    : #{highest_deal}", file=out)
+            if push_summary is not None:
+                print("-" * 76, file=out)
+                print("  PUSHED TO LEDGERFX (duplicate-safe):", file=out)
+                print(f"    New deals        : {push_summary.deals_inserted}", file=out)
+                print(f"    Corrected deals  : {push_summary.deals_updated}", file=out)
+                print(f"    Already present  : {push_summary.deals_unchanged}", file=out)
+                print(f"    Rejected rows    : {push_summary.deals_rejected}", file=out)
+                print(f"    New balance ops  : {push_summary.balance_ops_inserted}", file=out)
+                if push_summary.open_positions is not None:
+                    print(f"    Open positions   : {push_summary.open_positions}", file=out)
+                if push_summary.reconciliation:
+                    rec = push_summary.reconciliation
+                    print(
+                        f"    Balance check    : broker {rec.get('reportedBalance')} vs imported "
+                        f"{rec.get('computedBalance')} (difference {rec.get('difference')})",
+                        file=out,
+                    )
+            if artifacts is not None:
+                print("-" * 76, file=out)
+                print(f"  LedgerFX Deals CSV: {artifacts.deals_csv}", file=out)
+                print(f"  Account Info CSV  : {artifacts.account_info_csv}", file=out)
+                print(f"  Open Positions CSV: {artifacts.open_positions_csv}", file=out)
+                print(f"  Orders CSV        : {artifacts.orders_csv}", file=out)
+                print(f"  Run Report JSON   : {artifacts.report_json}", file=out)
             print(f"  Checkpoint File   : {cp_path}", file=out)
             if cp_backup:
                 print(f"  Checkpoint Backup : {cp_backup}", file=out)
-            if artifacts.warnings:
+            all_warnings = (artifacts.warnings if artifacts is not None else []) + push_warnings
+            if push_summary is not None:
+                all_warnings += push_summary.rejections
+            if all_warnings:
                 print("-" * 76, file=out)
                 print("  Warnings:", file=out)
-                for w in artifacts.warnings:
+                for w in all_warnings[:30]:
                     print(f"    - {w}", file=out)
             print("-" * 76, file=out)
-            print(
-                "  Next Step: In LedgerFX -> Accounts -> Import CSV, upload the Deals CSV above.",
-                file=out,
-            )
+            if push_summary is None:
+                print(
+                    "  Next Step: In LedgerFX -> Accounts -> Import CSV, upload the Deals CSV above.",
+                    file=out,
+                )
+            else:
+                print("  Next Step: open LedgerFX — your journal is already up to date.", file=out)
             print("=" * 76, file=out)
             return 0
 
-    except (MT5CollectorError, RuntimeError, ValueError, OSError) as exc:
+    except (MT5CollectorError, PushError, RuntimeError, ValueError, OSError) as exc:
         print("", file=out)
         print("=" * 76, file=out)
         print("LEDGERFX MT5 COLLECTION REPORT — FAILED", file=out)
@@ -353,6 +439,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--push-url",
+        type=str,
+        default=None,
+        help=(
+            "Optional: push history straight into your LedgerFX server, e.g. "
+            "https://your-host/api/ingest/<accountId> (HTTPS required except localhost). "
+            "The token is read from an environment variable or --token-file, never from the command line."
+        ),
+    )
+    parser.add_argument(
+        "--token-env",
+        type=str,
+        default=DEFAULT_TOKEN_ENV,
+        help=f"Environment variable holding the LedgerFX ingest token (default: {DEFAULT_TOKEN_ENV}).",
+    )
+    parser.add_argument(
+        "--token-file",
+        type=Path,
+        default=None,
+        help="Optional file containing the LedgerFX ingest token (alternative to the environment variable).",
+    )
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="With --push-url: skip writing local CSV files (data goes only to LedgerFX).",
+    )
+    parser.add_argument(
         "--generate-sample",
         action="store_true",
         help="Generate synthetic sample CSVs into sample_output/ without connecting to MetaTrader 5.",
@@ -382,6 +495,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         lookback_days=args.lookback_days,
         chunk_days=args.chunk_days,
         confirm_investor_session=args.confirm_investor_session,
+        push_url=args.push_url,
+        token_env=args.token_env,
+        token_file=args.token_file,
+        no_csv=args.no_csv,
     )
     return run_collection(config)
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, List, Optional, Protocol
+from typing import Any, List, Optional, Protocol, Sequence
 
 from .config import build_date_chunks
 
@@ -214,6 +214,30 @@ class ReadOnlyMT5Client:
                     seen[ticket] = deal
 
         return sorted(seen.values(), key=lambda d: (int(getattr(d, "time", 0) or 0), int(getattr(d, "ticket", 0))))
+
+    def get_orders_for_positions(self, position_ids: Sequence[int], limit: int = 500) -> List[Any]:
+        """
+        Read-only lookup of the orders belonging to specific positions (MT5: history_orders_get(position=...)).
+        Used to recover the ORIGINAL SL/TP of positions that were opened before the fetch window, so their
+        R-multiple stays correct on incremental runs. Silently returns [] if the backend has no such lookup.
+        """
+        mt5 = self._load_backend()
+        fetch = getattr(mt5, "history_orders_get", None)
+        if fetch is None:
+            return []
+        found: dict[int, Any] = {}
+        for pos_id in sorted({int(p) for p in position_ids if int(p) > 0})[:limit]:
+            try:
+                orders = fetch(position=pos_id)
+            except TypeError:
+                return []
+            if orders is None:
+                continue
+            for order in orders:
+                ticket = int(getattr(order, "ticket", 0) or 0)
+                if ticket > 0:
+                    found[ticket] = order
+        return list(found.values())
 
     def get_history_orders(
         self,
