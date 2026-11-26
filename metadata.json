@@ -1,0 +1,6 @@
+{
+  "name": "LedgerFX — MT5 Forex Trading Journal",
+  "description": "Personal MetaTrader 5 Forex trading journal portal for automated deal synchronisation, position-grouped journaling, performance analytics, daily psychology logs, and retrospective AI insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

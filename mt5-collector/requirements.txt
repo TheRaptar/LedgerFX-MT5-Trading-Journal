@@ -1,0 +1,2 @@
+# Official MetaQuotes MetaTrader 5 Python integration (Windows only, requires MT5 Desktop Terminal)
+MetaTrader5>=5.0.45
