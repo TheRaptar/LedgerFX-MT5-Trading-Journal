@@ -3,7 +3,8 @@
  * Run with: npx tsx tests/ingest.test.ts
  */
 import assert from 'node:assert/strict';
-import { openDatabase, insertAccountRow, upsertDeal } from '../server/db.ts';
+import { insertAccountRow, upsertDeal } from '../server/db.ts';
+import { openDatabase } from '../server/dbNode.ts';
 import {
   generateIngestToken,
   hashIngestToken,
