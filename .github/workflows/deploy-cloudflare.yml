@@ -1,0 +1,40 @@
+# Deploys LedgerFX to Cloudflare Workers (free plan). Required GitHub repository secrets:
+#   CLOUDFLARE_API_TOKEN  (Cloudflare "Edit Cloudflare Workers" template token)
+#   OWNER_PASSCODE        (the password used to unlock LedgerFX; 12+ characters recommended)
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [main, feat/collector-ingest-and-import-fixes]
+    paths-ignore: ["**/*.md", "mt5-collector/**", ".github/workflows/mt5-sync.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloudflare
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --legacy-peer-deps
+      - run: npx tsc --noEmit && npx tsc -p worker
+      - run: npx tsx tests/ingest.test.ts
+      - run: npx vite build
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: 3168cf634a23cb622605601c7287cec1
+          command: deploy
+          secrets: |
+            OWNER_PASSCODE
+        env:
+          OWNER_PASSCODE: ${{ secrets.OWNER_PASSCODE }}

@@ -14,5 +14,6 @@
     "bindings": [{ "name": "LEDGER", "class_name": "LedgerDO" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LedgerDO"] }],
+  "vars": { "APP_URL": "https://currencyfied.com" },
   "observability": { "enabled": true }
 }
