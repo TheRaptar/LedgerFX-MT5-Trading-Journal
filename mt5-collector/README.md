@@ -88,6 +88,10 @@ Subsequent runs pull only deals with a ticket higher than your saved checkpoint 
 
 ---
 
+## Free automatic sync (recommended)
+
+Run `powershell -ExecutionPolicy Bypass -File .\install_auto_sync.ps1` once. It asks for the LedgerFX ingest URL and token, saves the token in a file only your Windows user can read, and schedules a sync every 15 minutes and at each sign-in. Costs nothing. It syncs whenever this PC is on and MT5 is open and signed in with the Investor password; anything missed while it was off is caught up automatically on the next run. Remove it with `uninstall_auto_sync.ps1`.
+
 ## Optional: Periodic Local Runs via Windows Task Scheduler
 
 If you want Windows to run incremental exports periodically while your MT5 desktop terminal is open in an Investor Password session:
