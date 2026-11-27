@@ -10,7 +10,10 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx tests/ingest.test.ts && tsx mt5-collector/tests/verify_ledgerfx_import.ts && python3 -m unittest discover -s mt5-collector/tests"
+    "test": "tsx tests/ingest.test.ts && tsx mt5-collector/tests/verify_ledgerfx_import.ts && python3 -m unittest discover -s mt5-collector/tests",
+    "build:worker": "vite build",
+    "cf:dev": "vite build && wrangler dev",
+    "cf:deploy": "vite build && wrangler deploy"
   },
   "dependencies": {
     "@google/genai": "^3.6.1",
@@ -29,6 +32,8 @@
     "vite": "^8.3.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261127.1",
+    "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
@@ -37,6 +42,6 @@
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "wrangler": "^4.168.0"
   }
 }

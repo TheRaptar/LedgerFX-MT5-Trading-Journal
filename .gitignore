@@ -13,3 +13,6 @@ mt5-collector/.venv/
 mt5-collector/exports/
 mt5-collector/state/
 
+.dev.vars
+.wrangler
+.dev.vars

@@ -1,7 +1,5 @@
-import Database from 'better-sqlite3';
+import type { SyncDb, SyncStatement } from './syncDb.ts';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
 import {
   DEFAULT_SETTINGS,
   type AuditLogEntry,
@@ -19,10 +17,7 @@ import {
 import { encryptCredentialPayload } from './crypto.ts';
 import { createInitialSeedBundle } from './mt5Fixtures.ts';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const DB_PATH = path.join(DATA_DIR, 'ledgerfx.sqlite');
-
-let dbInstance: Database.Database | null = null;
+let dbProvider: (() => SyncDb) | null = null;
 let ephemeralEncSecret: string | null = null;
 
 export function getCredentialSecret(): string {
@@ -46,35 +41,24 @@ export function getCredentialSecret(): string {
   return ephemeralEncSecret;
 }
 
-/** Opens (and migrates) a database at any path, including ':memory:' — used by tests and getDb(). */
-export function openDatabase(filePath: string): Database.Database {
-  const db = new Database(filePath);
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('foreign_keys = ON');
-  db.pragma('busy_timeout = 5000');
-  db.pragma('cache_size = -20000');
-  initSchema(db);
-  migrateSchema(db);
-  return db;
+/** The host (Node server, tests or Durable Object) supplies the database. */
+export function setDbProvider(provider: () => SyncDb): void {
+  dbProvider = provider;
 }
 
-export function getDb(): Database.Database {
-  if (dbInstance) return dbInstance;
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  const db = openDatabase(DB_PATH);
-  dbInstance = db;
-  // Demo data is opt-in: fake accounts must never be mixed into a real trading journal.
-  if (process.env.SEED_DEMO_DATA === 'true') {
-    seedIfEmpty(db);
-  }
-  return db;
+export function getDb(): SyncDb {
+  if (!dbProvider) throw new Error('No database provider configured.');
+  return dbProvider();
+}
+
+/** Creates tables and applies additive migrations. Safe to call on every start. */
+export function initializeDatabase(db: SyncDb): void {
+  initSchema(db);
+  migrateSchema(db);
 }
 
 /** Additive, idempotent migrations for databases created by earlier versions. */
-function migrateSchema(db: Database.Database): void {
+function migrateSchema(db: SyncDb): void {
   const cols = (db.prepare('PRAGMA table_info(mt5_accounts)').all() as Array<{ name: string }>).map((c) => c.name);
   if (!cols.includes('ingest_token_hash')) {
     db.exec('ALTER TABLE mt5_accounts ADD COLUMN ingest_token_hash TEXT');
@@ -93,7 +77,7 @@ function migrateSchema(db: Database.Database): void {
   `);
 }
 
-function initSchema(db: Database.Database): void {
+function initSchema(db: SyncDb): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS app_meta (
       key TEXT PRIMARY KEY,
@@ -255,7 +239,7 @@ function initSchema(db: Database.Database): void {
   `);
 }
 
-function seedIfEmpty(db: Database.Database): void {
+export function seedIfEmpty(db: SyncDb): void {
   const seeded = db.prepare('SELECT value FROM app_meta WHERE key = ?').get('initial_seeded');
   if (seeded) return;
 
@@ -310,7 +294,7 @@ function seedIfEmpty(db: Database.Database): void {
 }
 
 export function insertAccountRow(
-  db: Database.Database,
+  db: SyncDb,
   acc: MT5Account,
   encryptedCredentials: string | null,
 ): void {
@@ -352,10 +336,10 @@ export function insertAccountRow(
 
 export type UpsertResult = 'inserted' | 'updated' | 'unchanged';
 
-const stmtCache = new WeakMap<Database.Database, Map<string, Database.Statement>>();
+const stmtCache = new WeakMap<SyncDb, Map<string, SyncStatement>>();
 
 /** Prepared-statement cache so bulk imports of thousands of rows don't re-prepare SQL per row. */
-function stmt(db: Database.Database, sql: string): Database.Statement {
+function stmt(db: SyncDb, sql: string): SyncStatement {
   let perDb = stmtCache.get(db);
   if (!perDb) {
     perDb = new Map();
@@ -380,7 +364,7 @@ const numEq = (a: unknown, b: unknown): boolean => {
  * Duplicate-safe write keyed by (account_id, ticket). New tickets are inserted; an existing ticket is
  * UPDATED when the broker amended it (e.g. late commission/swap) and left alone when identical.
  */
-export function upsertDeal(db: Database.Database, incoming: MT5Deal): UpsertResult {
+export function upsertDeal(db: SyncDb, incoming: MT5Deal): UpsertResult {
   const d = { ...incoming };
   const existing = stmt(
     db,
@@ -445,7 +429,7 @@ export function upsertDeal(db: Database.Database, incoming: MT5Deal): UpsertResu
   return 'updated';
 }
 
-export function upsertBalanceOp(db: Database.Database, op: BalanceOperation): UpsertResult {
+export function upsertBalanceOp(db: SyncDb, op: BalanceOperation): UpsertResult {
   const existing = stmt(
     db,
     'SELECT deal_type, amount, utc_time, comment FROM balance_operations WHERE account_id = ? AND ticket = ?',
@@ -478,7 +462,7 @@ export function upsertBalanceOp(db: Database.Database, op: BalanceOperation): Up
   return 'updated';
 }
 
-export function upsertOpenPosition(db: Database.Database, p: MT5OpenPosition): void {
+export function upsertOpenPosition(db: SyncDb, p: MT5OpenPosition): void {
   db.prepare(
     `INSERT OR REPLACE INTO mt5_open_positions (
       account_id, ticket, symbol, direction, volume, open_price, current_price,
@@ -506,7 +490,7 @@ export function upsertOpenPosition(db: Database.Database, p: MT5OpenPosition): v
   );
 }
 
-export function upsertTradeJournal(db: Database.Database, j: TradeJournalEntry): void {
+export function upsertTradeJournal(db: SyncDb, j: TradeJournalEntry): void {
   db.prepare(
     `INSERT OR REPLACE INTO trade_journals (
       account_id, position_id, strategy, tags_json, initial_risk_currency,
@@ -531,7 +515,7 @@ export function upsertTradeJournal(db: Database.Database, j: TradeJournalEntry):
   );
 }
 
-export function upsertDailyJournal(db: Database.Database, dj: DailyJournalEntry): void {
+export function upsertDailyJournal(db: SyncDb, dj: DailyJournalEntry): void {
   db.prepare(
     `INSERT OR REPLACE INTO daily_journals (
       date, narrative, mood, discipline, stress, confidence, session_label, lessons, updated_at_utc
@@ -549,7 +533,7 @@ export function upsertDailyJournal(db: Database.Database, dj: DailyJournalEntry)
   );
 }
 
-export function upsertPeriodicReview(db: Database.Database, rev: PeriodicReview): void {
+export function upsertPeriodicReview(db: SyncDb, rev: PeriodicReview): void {
   db.prepare(
     `INSERT OR REPLACE INTO periodic_reviews (
       id, period_type, period_label, start_date, end_date,
@@ -569,7 +553,7 @@ export function upsertPeriodicReview(db: Database.Database, rev: PeriodicReview)
   );
 }
 
-export function upsertCalendarEvent(db: Database.Database, ev: CalendarEventMarker): void {
+export function upsertCalendarEvent(db: SyncDb, ev: CalendarEventMarker): void {
   db.prepare(
     `INSERT OR REPLACE INTO calendar_events (id, date, title, category, impact, notes)
      VALUES (?, ?, ?, ?, ?, ?)`,
@@ -577,7 +561,7 @@ export function upsertCalendarEvent(db: Database.Database, ev: CalendarEventMark
 }
 
 export function appendAuditLog(
-  db: Database.Database,
+  db: SyncDb,
   action: string,
   entity: string,
   details: string,
@@ -590,7 +574,7 @@ export function appendAuditLog(
   );
 }
 
-export function createSessionRecord(db: Database.Database, tokenHash: string): void {
+export function createSessionRecord(db: SyncDb, tokenHash: string): void {
   const now = Date.now();
   db.prepare(
     'INSERT OR REPLACE INTO auth_sessions (token_hash, created_at, last_activity) VALUES (?, ?, ?)',
@@ -598,7 +582,7 @@ export function createSessionRecord(db: Database.Database, tokenHash: string): v
 }
 
 export function verifyAndTouchSession(
-  db: Database.Database,
+  db: SyncDb,
   tokenHash: string,
   timeoutMs: number,
 ): boolean {
@@ -615,11 +599,11 @@ export function verifyAndTouchSession(
   return true;
 }
 
-export function deleteSessionRecord(db: Database.Database, tokenHash: string): void {
+export function deleteSessionRecord(db: SyncDb, tokenHash: string): void {
   db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').run(tokenHash);
 }
 
-export function getUserSettings(db: Database.Database): UserSettings {
+export function getUserSettings(db: SyncDb): UserSettings {
   const row = db.prepare('SELECT value FROM app_meta WHERE key = ?').get('user_settings') as
     | { value: string }
     | undefined;
@@ -631,7 +615,7 @@ export function getUserSettings(db: Database.Database): UserSettings {
   }
 }
 
-export function saveUserSettings(db: Database.Database, next: Partial<UserSettings>): UserSettings {
+export function saveUserSettings(db: SyncDb, next: Partial<UserSettings>): UserSettings {
   const merged: UserSettings = { ...getUserSettings(db), ...next };
   db.prepare('INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)').run(
     'user_settings',
@@ -640,7 +624,7 @@ export function saveUserSettings(db: Database.Database, next: Partial<UserSettin
   return merged;
 }
 
-export function recalculateAccountBalances(db: Database.Database, accountId: string): void {
+export function recalculateAccountBalances(db: SyncDb, accountId: string): void {
   const opsSumRow = db
     .prepare('SELECT COALESCE(SUM(amount), 0) AS total FROM balance_operations WHERE account_id = ?')
     .get(accountId) as { total: number };
@@ -670,7 +654,7 @@ export function recalculateAccountBalances(db: Database.Database, accountId: str
   ).run(balance, equity, dealsSumRow.max_ticket, dealsSumRow.earliest, accountId);
 }
 
-export function loadBootstrapPayload(db: Database.Database): BootstrapPayload {
+export function loadBootstrapPayload(db: SyncDb): BootstrapPayload {
   const accountRows = db.prepare('SELECT * FROM mt5_accounts ORDER BY created_at_utc ASC').all() as Array<
     Record<string, unknown>
   >;

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type Database from 'better-sqlite3';
+import type { SyncDb } from './syncDb.ts';
 import type {
   BalanceOperation,
   MT5Deal,
@@ -33,7 +33,7 @@ export function hashIngestToken(token: string): string {
   return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
-export function verifyIngestToken(db: Database.Database, accountId: string, token: string): boolean {
+export function verifyIngestToken(db: SyncDb, accountId: string, token: string): boolean {
   if (!token.startsWith(INGEST_TOKEN_PREFIX)) return false;
   const row = db.prepare('SELECT ingest_token_hash FROM mt5_accounts WHERE id = ?').get(accountId) as
     | { ingest_token_hash: string | null }
@@ -282,7 +282,7 @@ const bump = (t: Tally, r: UpsertResult) => {
 
 const norm = (s: string) => s.trim().toLowerCase();
 
-export function processIngest(db: Database.Database, account: IngestAccountRow, body: unknown): IngestOutcome {
+export function processIngest(db: SyncDb, account: IngestAccountRow, body: unknown): IngestOutcome {
   if (!isObj(body)) return { ok: false, status: 400, error: 'Request body must be a JSON object.' };
 
   const info = isObj(body.accountInfo) ? body.accountInfo : null;
@@ -454,7 +454,7 @@ export function processIngest(db: Database.Database, account: IngestAccountRow, 
 // ---------------------------------------------------------------------------------------------
 
 export function rebuildAccountTimestamps(
-  db: Database.Database,
+  db: SyncDb,
   accountId: string,
   serverTimeZone: string,
   serverUtcOffsetLabel: string,
