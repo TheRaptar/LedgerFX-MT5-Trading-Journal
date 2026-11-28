@@ -14,6 +14,10 @@ on:
         default: "incremental"
         type: choice
         options: [incremental, full]
+      dry_run:
+        description: "Test only: read the account and print a report, send nothing to LedgerFX"
+        default: false
+        type: boolean
 
 concurrency:
   group: mt5-sync
@@ -123,11 +127,13 @@ jobs:
           LEDGERFX_INGEST_TOKEN: ${{ secrets.LEDGERFX_INGEST_TOKEN }}
           LEDGERFX_INGEST_URL: ${{ secrets.LEDGERFX_INGEST_URL }}
           SYNC_MODE: ${{ github.event.inputs.mode || 'incremental' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         working-directory: mt5-collector
         run: |
           $args = @("collect_mt5.py", "--mode", $env:SYNC_MODE, "--lookback-days", "30",
-                    "--confirm-investor-session", "--push-url", $env:LEDGERFX_INGEST_URL,
-                    "--terminal-path", $env:MT5_TERMINAL, "--no-csv")
+                    "--confirm-investor-session", "--terminal-path", $env:MT5_TERMINAL)
+          if ($env:DRY_RUN -eq "true") { Write-Host "DRY RUN: nothing will be sent to LedgerFX." }
+          else { $args += @("--push-url", $env:LEDGERFX_INGEST_URL, "--no-csv") }
           $code = 1
           for ($i = 1; $i -le 3; $i++) {
             python @args
