@@ -5,8 +5,8 @@
 name: MT5 Auto Sync
 
 on:
-  schedule:
-    - cron: "23 */2 * * *"   # every 2 hours (GitHub may delay scheduled runs)
+  # Scheduled runs disabled: the broker session cannot be established from GitHub's runners
+  # (IPC timeout, verified 2026-11-28). Use the Windows scheduled task instead (mt5-collector/install_auto_sync.ps1).
   workflow_dispatch:
     inputs:
       mode:
