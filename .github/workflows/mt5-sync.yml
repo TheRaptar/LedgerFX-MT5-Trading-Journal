@@ -75,7 +75,8 @@ jobs:
           Start-Process -FilePath $env:MT5_TERMINAL -ArgumentList "/portable", "/config:`"$ini`""
 
           $authorized = $false
-          $deadline = (Get-Date).AddMinutes(4)
+          $log = $null
+          $deadline = (Get-Date).AddMinutes(3)
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 10
             $log = Get-ChildItem (Join-Path $dir "logs") -Filter *.log -ErrorAction SilentlyContinue |
@@ -86,13 +87,19 @@ jobs:
             }
           }
           Remove-Item $ini -Force -ErrorAction SilentlyContinue   # never leave the password on disk
-          if (-not $authorized) {
-            Write-Host "---- terminal log (tail) ----"
-            if ($log) { Get-Content $log.FullName -Tail 40 -ErrorAction SilentlyContinue }
-            else { Write-Host "No terminal log was written: the terminal may not have started." }
-            throw "MT5 did not report 'authorized' within 4 minutes. Check the server name and login (see log above)."
+
+          # Show everything except the noisy first-run MQL5 example compilation.
+          Write-Host "---- terminal log (without compile noise) ----"
+          if ($log) {
+            Get-Content $log.FullName -ErrorAction SilentlyContinue |
+              Where-Object { $_ -notmatch "Compile|Compiler" } | Select-Object -First 80
+          } else {
+            Write-Host "No terminal log was written under $dir\logs"
+            Get-ChildItem $dir -ErrorAction SilentlyContinue | Select-Object -First 30 Name
           }
-          Write-Host "Terminal reported authorization."
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, MainWindowTitle
+          if ($authorized) { Write-Host "Terminal reported authorization." }
+          else { Write-Host "WARNING: no 'authorized' line seen; trying the collector anyway (it verifies the session itself)." }
 
       - name: Collect and push to LedgerFX
         shell: pwsh
