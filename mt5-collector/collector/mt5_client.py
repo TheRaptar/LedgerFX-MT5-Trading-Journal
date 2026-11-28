@@ -11,6 +11,7 @@ Security & compliance invariants:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, List, Optional, Protocol, Sequence
@@ -100,7 +101,15 @@ class ReadOnlyMT5Client:
     def connect(self) -> None:
         """Attach to the already-open MT5 desktop terminal without passing any credentials."""
         mt5 = self._load_backend()
-        ok = mt5.initialize(path=self._terminal_path) if self._terminal_path else mt5.initialize()
+        if self._terminal_path:
+            kwargs: dict = {"path": self._terminal_path}
+            # A terminal started with /portable keeps its data beside the exe; the Python bridge must be
+            # told, otherwise it looks in %APPDATA% and fails with IPC timeout (-10005).
+            if os.environ.get("MT5_PORTABLE") == "1":
+                kwargs["portable"] = True
+            ok = mt5.initialize(**kwargs)
+        else:
+            ok = mt5.initialize()
         if not ok:
             err = mt5.last_error()
             raise MT5DisconnectedError(

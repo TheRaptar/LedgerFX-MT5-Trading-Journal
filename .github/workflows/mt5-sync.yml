@@ -51,6 +51,7 @@ jobs:
           Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep -Seconds 3
           "MT5_TERMINAL=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MT5_PORTABLE=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Start terminal signed in (read-only) and wait for authorization
         shell: pwsh
