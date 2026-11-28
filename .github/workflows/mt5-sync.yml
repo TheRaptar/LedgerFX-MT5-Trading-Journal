@@ -90,14 +90,21 @@ jobs:
           Remove-Item $ini -Force -ErrorAction SilentlyContinue   # never leave the password on disk
 
           # Show everything except the noisy first-run MQL5 example compilation.
-          Write-Host "---- terminal log (without compile noise) ----"
-          if ($log) {
-            Get-Content $log.FullName -ErrorAction SilentlyContinue |
-              Where-Object { $_ -notmatch "Compile|Compiler" } | Select-Object -First 80
-          } else {
-            Write-Host "No terminal log was written under $dir\logs"
-            Get-ChildItem $dir -ErrorAction SilentlyContinue | Select-Object -First 30 Name
+          Write-Host "---- every log file under the install folder ----"
+          $logs = Get-ChildItem $dir -Recurse -Filter *.log -ErrorAction SilentlyContinue
+          $logs | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          Write-Host "---- connection-related lines from all logs ----"
+          foreach ($f in $logs) {
+            Get-Content $f.FullName -ErrorAction SilentlyContinue |
+              Where-Object { $_ -match "authoriz|connect|network|login|invalid|account|server|fail|error|expired|trade|ping" -and $_ -notmatch "Compile|Compiler" } |
+              Select-Object -First 40 | ForEach-Object { Write-Host "[$($f.Name)] $_" }
           }
+          Write-Host "---- last 25 raw lines of the newest log ----"
+          if ($log) { Get-Content $log.FullName -Tail 25 -ErrorAction SilentlyContinue }
+          else { Write-Host "No terminal log was written under $dir\logs"; Get-ChildItem $dir | Select-Object -First 30 Name }
+          Write-Host "---- network reachability from the runner ----"
+          Get-NetTCPConnection -OwningProcess (Get-Process terminal64 -ErrorAction SilentlyContinue).Id -ErrorAction SilentlyContinue |
+            Select-Object State, RemoteAddress, RemotePort | Format-Table | Out-String | Write-Host
           Get-Process terminal64 -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, MainWindowTitle
           if ($authorized) { Write-Host "Terminal reported authorization." }
           else { Write-Host "WARNING: no 'authorized' line seen; trying the collector anyway (it verifies the session itself)." }
