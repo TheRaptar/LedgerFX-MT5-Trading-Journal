@@ -109,6 +109,14 @@ jobs:
           if ($authorized) { Write-Host "Terminal reported authorization." }
           else { Write-Host "WARNING: no 'authorized' line seen; trying the collector anyway (it verifies the session itself)." }
 
+      - name: Log the terminal in through the Python bridge
+        shell: pwsh
+        env:
+          MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
+          MT5_INVESTOR_PASSWORD: ${{ secrets.MT5_INVESTOR_PASSWORD }}
+          MT5_SERVER: ${{ secrets.MT5_SERVER }}
+        run: python .github/scripts/mt5_login_probe.py
+
       - name: Collect and push to LedgerFX
         shell: pwsh
         env:
