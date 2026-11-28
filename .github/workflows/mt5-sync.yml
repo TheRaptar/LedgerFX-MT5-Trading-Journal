@@ -45,9 +45,14 @@ jobs:
           Start-Process -FilePath $setup -ArgumentList "/auto" -Wait
           $terminal = "C:\Program Files\MetaTrader 5\terminal64.exe"
           if (-not (Test-Path $terminal)) { throw "MT5 terminal was not installed at the expected path." }
+          # The installer launches a first-run terminal (account wizard). It would swallow our startup
+          # config because MT5 is single-instance, so stop it before starting our own.
+          Start-Sleep -Seconds 10
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 3
           "MT5_TERMINAL=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Start terminal signed in (read-only)
+      - name: Start terminal signed in (read-only) and wait for authorization
         shell: pwsh
         env:
           MT5_LOGIN: ${{ secrets.MT5_LOGIN }}
@@ -57,6 +62,7 @@ jobs:
           foreach ($n in "MT5_LOGIN","MT5_INVESTOR_PASSWORD","MT5_SERVER") {
             if (-not (Get-Item "env:$n" -ErrorAction SilentlyContinue).Value) { throw "Missing repository secret for $n." }
           }
+          $dir = Split-Path $env:MT5_TERMINAL
           $ini = Join-Path $env:RUNNER_TEMP "mt5-startup.ini"
           @(
             "[Common]",
@@ -66,9 +72,27 @@ jobs:
             "KeepPrivate=1",
             "NewsEnable=0"
           ) | Set-Content -Path $ini -Encoding ASCII
-          Start-Process -FilePath $env:MT5_TERMINAL -ArgumentList "/config:`"$ini`""
-          Start-Sleep -Seconds 45
-          Remove-Item $ini -Force   # the terminal has already read it; do not leave the password on disk
+          Start-Process -FilePath $env:MT5_TERMINAL -ArgumentList "/portable", "/config:`"$ini`""
+
+          $authorized = $false
+          $deadline = (Get-Date).AddMinutes(4)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $log = Get-ChildItem (Join-Path $dir "logs") -Filter *.log -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($log) {
+              $text = Get-Content $log.FullName -Raw -ErrorAction SilentlyContinue
+              if ($text -match "authorized on") { $authorized = $true; break }
+            }
+          }
+          Remove-Item $ini -Force -ErrorAction SilentlyContinue   # never leave the password on disk
+          if (-not $authorized) {
+            Write-Host "---- terminal log (tail) ----"
+            if ($log) { Get-Content $log.FullName -Tail 40 -ErrorAction SilentlyContinue }
+            else { Write-Host "No terminal log was written: the terminal may not have started." }
+            throw "MT5 did not report 'authorized' within 4 minutes. Check the server name and login (see log above)."
+          }
+          Write-Host "Terminal reported authorization."
 
       - name: Collect and push to LedgerFX
         shell: pwsh
@@ -82,11 +106,32 @@ jobs:
                     "--confirm-investor-session", "--push-url", $env:LEDGERFX_INGEST_URL,
                     "--terminal-path", $env:MT5_TERMINAL, "--no-csv")
           $code = 1
-          for ($i = 1; $i -le 6; $i++) {
+          for ($i = 1; $i -le 3; $i++) {
             python @args
             $code = $LASTEXITCODE
             if ($code -ne 1) { break }          # 0 = ok, 2 = refused (trading enabled): never retry
-            Write-Host "Attempt $i failed (terminal may still be connecting). Retrying in 30s..."
-            Start-Sleep -Seconds 30
+            Write-Host "Attempt $i failed. Retrying in 20s..."
+            Start-Sleep -Seconds 20
           }
           exit $code
+
+      - name: Capture desktop for diagnosis (failure only)
+        if: failure()
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save((Join-Path $env:RUNNER_TEMP "desktop.png"))
+          Get-Process terminal64 -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, MainWindowTitle
+
+      - name: Upload desktop screenshot (failure only, kept 1 day)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-on-failure
+          path: ${{ runner.temp }}/desktop.png
+          retention-days: 1
+          if-no-files-found: ignore
